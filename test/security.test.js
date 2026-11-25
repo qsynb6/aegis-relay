@@ -1,19 +1,39 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import {deriveKey,hashPassword,verifyPassword,newTotpSecret,totp,verifyTotp,isPrivateIP,cleanAlias,tokenDigest} from '../src/security.js';
-test('password hashes are salted and verifiable',()=>{const a=hashPassword('a very long password!'),b=hashPassword('a very long password!');assert.notEqual(a,b);assert.equal(verifyPassword('a very long password!',a),true);assert.equal(verifyPassword('wrong password here',a),false)});
-test('TOTP follows RFC 6238 SHA1 vector',()=>{assert.equal(totp('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',59000),'287082');assert.equal(verifyTotp(newTotpSecret(),'000000',0),false)});
-test('private address detection covers common ranges',()=>{for(const ip of ['127.0.0.1','10.1.2.3','172.16.0.1','192.168.1.2','::1','fd00::1'])assert.equal(isPrivateIP(ip),true);assert.equal(isPrivateIP('1.1.1.1'),false)});
+import {deriveKey,hashPassword,LoginGuard,verifyPassword,verifyPasswordAsync,newTotpSecret,totp,verifyTotp,verifyTotpStep,isPrivateIP,cleanAlias,tokenDigest} from '../src/security.js';
+test('password hashes are salted and verifiable',async()=>{const a=hashPassword('a very long password!'),b=hashPassword('a very long password!');assert.notEqual(a,b);assert.equal(verifyPassword('a very long password!',a),true);assert.equal(verifyPassword('wrong password here',a),false);assert.equal(await verifyPasswordAsync('a very long password!',a),true);assert.equal(await verifyPasswordAsync('wrong password here',a),false);assert.equal(await verifyPasswordAsync('x'.repeat(1025),a),false);assert.throws(()=>hashPassword('x'.repeat(1025)),/1024/)});
+test('TOTP follows RFC 6238 SHA1 vector and rejects replayed steps',()=>{const s='GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',code=totp(s,59000);assert.equal(code,'287082');assert.equal(verifyTotp(newTotpSecret(),'000000',0),false);const step=verifyTotpStep(s,code,59000,null);assert.equal(step,1);assert.equal(verifyTotpStep(s,code,59000,step),null);assert.equal(verifyTotpStep(s,code,60000,step),null)});
+test('private address detection covers RFC 1918, CGNAT, benchmarking, and IPv6 reserved ranges',()=>{for(const ip of ['127.0.0.1','10.1.2.3','100.64.0.1','100.100.100.200','172.16.0.1','192.168.1.2','192.0.0.1','198.18.0.1','::1','0:0:0:0:0:0:0:1','fc00::1','fd00::1','fe80::1','ff02::1','64:ff9b::1'])assert.equal(isPrivateIP(ip),true,`${ip} must be blocked`);for(const pub of ['1.1.1.1','8.8.8.8','100.63.255.255','100.128.0.1','198.51.100.4','203.0.113.9'])assert.equal(isPrivateIP(pub),false,`${pub} must remain public`)});
 test('aliases and keyed token digests',()=>{assert.equal(cleanAlias('media-1'),'media-1');assert.throws(()=>cleanAlias('../x'));const k=deriveKey('x'.repeat(32));assert.equal(tokenDigest('a',k),tokenDigest('a',k));assert.notEqual(tokenDigest('a',k),tokenDigest('b',k))});
 import {RateLimiter,requestIp} from '../src/security.js';
-test('request IP trusts X-Real-IP only from a loopback peer',()=>{
+test('request IP trusts X-Real-IP from loopback, explicit trusted proxies, or Docker bridge when loopback-bound',()=>{
   const make=(remote,real)=>({socket:{remoteAddress:remote},headers:real?{'x-real-ip':real}:{}});
-  assert.equal(requestIp(make('127.0.0.1','203.0.113.9')),'203.0.113.9');
-  assert.equal(requestIp(make('::1','203.0.113.9')),'203.0.113.9');
-  assert.equal(requestIp(make('::ffff:127.0.0.1','203.0.113.9')),'203.0.113.9');
-  assert.equal(requestIp(make('198.51.100.4','203.0.113.9')),'198.51.100.4');
-  assert.equal(requestIp(make('127.0.0.1','not-an-ip')),'127.0.0.1');
-  assert.equal(requestIp(make('127.0.0.1','')),'127.0.0.1');
-  assert.equal(requestIp({socket:{},headers:{}}),'unknown');
+  assert.equal(requestIp(make('127.0.0.1','203.0.113.9'),{}),'203.0.113.9');
+  assert.equal(requestIp(make('::1','203.0.113.9'),{}),'203.0.113.9');
+  assert.equal(requestIp(make('::ffff:127.0.0.1','203.0.113.9'),{}),'203.0.113.9');
+  assert.equal(requestIp(make('198.51.100.4','203.0.113.9'),{ADMIN_PUBLISH_IP:'127.0.0.1'}),'198.51.100.4');
+  assert.equal(requestIp(make('172.18.0.1','203.0.113.9'),{ADMIN_PUBLISH_IP:'127.0.0.1'}),'203.0.113.9');
+  assert.equal(requestIp(make('172.18.0.1','203.0.113.9'),{}),'172.18.0.1');
+  assert.equal(requestIp(make('172.18.0.1','203.0.113.9'),{TRUSTED_PROXIES:'172.18.0.1'}),'203.0.113.9');
+  assert.equal(requestIp({socket:{},headers:{'x-real-ip':'203.0.113.9'}},{ADMIN_PUBLISH_IP:'127.0.0.1'}),'unknown');
+  assert.equal(requestIp(make('127.0.0.1','not-an-ip'),{}),'127.0.0.1');
+  assert.equal(requestIp(make('127.0.0.1',''),{}),'127.0.0.1');
+  assert.equal(requestIp({socket:{},headers:{}},{}),'unknown');
+});
+test('login guard applies exponential account-level backoff and resets on success',()=>{
+  const g=new LoginGuard(3,10_000,60_000);
+  assert.equal(g.check(1000).allowed,true);
+  g.recordFailure(1000);g.recordFailure(2000);
+  assert.equal(g.check(2500).allowed,true);
+  g.recordFailure(3000);
+  const locked=g.check(4000);
+  assert.equal(locked.allowed,false);
+  assert.equal(locked.retryAfter,9);
+  assert.equal(g.check(13000).allowed,true);
+  g.recordFailure(14000);
+  assert.equal(g.check(25000).allowed,false);
+  g.recordSuccess();
+  assert.equal(g.check(25000).allowed,true);
+  assert.equal(g.failures,0);
 });
 test('rate limiter table stays bounded under many distinct keys',()=>{
   const limiter=new RateLimiter(3,60_000,100);

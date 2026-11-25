@@ -17,7 +17,7 @@ DOMAIN=$(read_field desiredDomain | tr '[:upper:]' '[:lower:]')
 EMAIL=$(read_field certificateEmail | tr '[:upper:]' '[:lower:]')
 printf '%s' "$REQUEST_ID" | grep -Eq '^[A-Za-z0-9_-]{8,80}$' || { rm -f "$REQUEST"; exit 1; }
 printf '%s' "$DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { rm -f "$REQUEST"; exit 1; }
-printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { rm -f "$REQUEST"; exit 1; }
+printf '%s' "$EMAIL" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' || { rm -f "$REQUEST"; exit 1; }
 
 write_status() {
   STATE=$1 MESSAGE=$2 CURRENT=${3:-}

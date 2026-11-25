@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cleanAlias, deriveKey, hashPassword, newTotpSecret, randomToken, RateLimiter, requestIp, tokenDigest, verifyPassword, verifyTotp, timingEqual } from './security.js';
+import { cleanAlias, deriveKey, hashPassword, LoginGuard, newTotpSecret, randomToken, RateLimiter, requestIp, tokenDigest, verifyPassword, verifyPasswordAsync, verifyTotp, verifyTotpStep, timingEqual } from './security.js';
 import { Store } from './store.js';
 import { dropRouteRuntime, getRuntimeStatus, handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS, validateUpstreamList } from './proxy.js';
 import { Metrics } from './metrics.js';
@@ -45,6 +45,18 @@ store.data.sessions = sessions;
 function pruneSessions(){const now=Date.now();for(const [sid,session] of Object.entries(sessions))if(!session||Number(session.expires)<now)delete sessions[sid];for(const [sid] of Object.entries(sessions).sort((a,b)=>Number(b[1].expires)-Number(a[1].expires)).slice(16))delete sessions[sid]}
 pruneSessions();
 const loginLimiter = new RateLimiter(6, 5 * 60_000);
+const setupLimiter = new RateLimiter(6, 10 * 60_000);
+const accountLimiter = new RateLimiter(10, 5 * 60_000);
+const loginGuard = new LoginGuard();
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+let lastDeniedAuditAt = 0;
+function auditLoginDenied(remoteIp) {
+  const now = Date.now();
+  if (now - lastDeniedAuditAt >= 60_000) {
+    lastDeniedAuditAt = now;
+    store.audit('login.denied', remoteIp);
+  }
+}
 const ui = fs.readFileSync(path.join(ROOT, 'web', 'index.html'),'utf8').replace('APP_JS',`app.js?v=${APP_VERSION}`).replace('STYLE_CSS',`style.css?v=${APP_VERSION}`).replace('HELP_CSS',`help.css?v=${APP_VERSION}`).replaceAll('APP_VERSION',APP_VERSION);
 const appjs = fs.readFileSync(path.join(ROOT,'web','app.js'));
 const stylesheet = fs.readFileSync(path.join(ROOT,'web','style.css'));
@@ -61,7 +73,7 @@ async function body(req, limit = 32 * 1024) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw Object.assign(new Error('invalid JSON'), { status: 400 }); }
 }
 function cookies(req) { return Object.fromEntries(String(req.headers.cookie || '').split(';').map(v=>v.trim().split('=').map(decodeURIComponent)).filter(v=>v.length===2)); }
-function auth(req) { const sid = cookies(req).aegis_session, s = Object.prototype.hasOwnProperty.call(sessions,sid)?sessions[sid]:null; if (!s || s.expires < Date.now()) { if(sid&&s){delete sessions[sid];store.save()} return null; } s.expires = Date.now() + 30 * 60_000; return { sid, ...s }; }
+function auth(req) { const sid = cookies(req).aegis_session, s = Object.prototype.hasOwnProperty.call(sessions,sid)?sessions[sid]:null; const now = Date.now(); if (!s || s.expires < now || (s.createdAt && now - Number(s.createdAt) > SESSION_MAX_AGE_MS)) { if(sid&&s){delete sessions[sid];store.save()} return null; } s.expires = now + 30 * 60_000; return { sid, ...s }; }
 function requireAuth(req) { const s = auth(req); if (!s) throw Object.assign(new Error('登录已失效，请重新登录'), { status: 401 }); if (!timingEqual(req.headers['x-csrf-token'] || '', s.csrf)) throw Object.assign(new Error('安全校验已失效，请重新登录'), { status: 403 }); return s; }
 function routeUpstreams(r) { return r.upstreams?.length?r.upstreams:(r.upstream?[r.upstream]:[]); }
 function cleanProfile(value = {}) {
@@ -167,19 +179,43 @@ async function api(req, res, rel, cookiePath = cfg.adminPath) {
   if (req.method === 'GET' && rel === '/branding') return json(res, 200, { icon:store.data.settings.panelIcon||'' });
   if (req.method === 'POST' && rel === '/setup') {
     if (store.data.admin) return json(res, 409, { error:'already initialized' });
+    if (!setupLimiter.take(ip(req))) return json(res, 429, { error:'try again later' });
     const b = await body(req); if (!cfg.setupToken || !timingEqual(b.setupToken || '', cfg.setupToken)) { store.audit('setup.denied', ip(req)); return json(res, 403, { error:'invalid setup token' }); }
     // A fresh install is password-only; two-factor is opt-in from 个人设置 afterwards.
-    store.data.admin = { username:String(b.username || 'admin').slice(0,64), passwordHash:hashPassword(b.password), totpSecret:null, recoveryDigests:[], createdAt:new Date().toISOString() };
+    store.data.admin = { username:String(b.username || 'admin').slice(0,64), passwordHash:hashPassword(b.password), totpSecret:null, lastTotpStep:null, recoveryDigests:[], createdAt:new Date().toISOString() };
     store.audit('admin.initialized', ip(req));
     return json(res, 201, { totpEnabled:false });
   }
   if (req.method === 'POST' && rel === '/login') {
-    if (!store.data.admin || !loginLimiter.take(ip(req))) { store.audit('login.denied', ip(req)); return json(res, 429, { error:'try again later' }); }
+    const clientIp = ip(req);
+    const guard = loginGuard.check();
+    if (!store.data.admin || !loginLimiter.take(clientIp) || !guard.allowed) {
+      auditLoginDenied(clientIp);
+      return json(res, 429, { error:'try again later' }, guard.retryAfter ? { 'retry-after': String(guard.retryAfter) } : {});
+    }
     const b = await body(req), a = store.data.admin, totpOn = !!a.totpSecret;
-    let second = !totpOn || verifyTotp(a.totpSecret, b.code);
-    if (totpOn && !second && b.recovery) { const d=tokenDigest(String(b.recovery),key), idx=(a.recoveryDigests||[]).findIndex(x=>timingEqual(x,d)); if(idx>=0){a.recoveryDigests.splice(idx,1);store.save();second=true;} }
-    if (!verifyPassword(b.password || '', a.passwordHash) || !second) { store.audit('login.failed', ip(req)); return json(res, 401, { error:'invalid credentials' }); }
-    const sid=randomToken(), csrf=randomToken(24); sessions[sid]={csrf,expires:Date.now()+30*60_000};pruneSessions();store.audit('login.success',ip(req));
+    const pwOk = await verifyPasswordAsync(b.password || '', a.passwordHash);
+    let matchedStep = null, recoveryIdx = -1;
+    if (totpOn) {
+      matchedStep = verifyTotpStep(a.totpSecret, b.code, Date.now(), a.lastTotpStep ?? null);
+      if (matchedStep === null && b.recovery) {
+        const d = tokenDigest(String(b.recovery).trim(), key);
+        recoveryIdx = (a.recoveryDigests || []).findIndex(x => timingEqual(x, d));
+      }
+    }
+    const secondOk = !totpOn || matchedStep !== null || recoveryIdx >= 0;
+    if (!pwOk || !secondOk) {
+      loginGuard.recordFailure();
+      store.audit('login.failed', clientIp);
+      return json(res, 401, { error:'invalid credentials' });
+    }
+    loginGuard.recordSuccess();
+    if (totpOn && matchedStep !== null) a.lastTotpStep = matchedStep;
+    else if (totpOn && recoveryIdx >= 0) a.recoveryDigests.splice(recoveryIdx, 1);
+    const now = Date.now(), sid = randomToken(), csrf = randomToken(24);
+    sessions[sid] = { csrf, createdAt: now, expires: now + 30 * 60_000 };
+    pruneSessions();
+    store.audit('login.success', clientIp);
     const cookie=`aegis_session=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=604800${cfg.secureCookies?'; Secure':''}`; return json(res,200,{csrf},{'set-cookie':cookie});
   }
   if (req.method === 'POST' && rel === '/logout') { const s=requireAuth(req);delete sessions[s.sid];store.audit('logout',ip(req));return json(res,200,{ok:true},{'set-cookie':`aegis_session=; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=0`}); }
@@ -187,7 +223,7 @@ async function api(req, res, rel, cookiePath = cfg.adminPath) {
   // holds the HttpOnly, SameSite=Strict session cookie. No CSRF token is required to read it, and the
   // strict cookie plus same-origin policy keep it unreadable to other sites.
   if (req.method === 'GET' && rel === '/session') { const s=auth(req); if(!s) return json(res,401,{error:'登录已失效，请重新登录'}); return json(res,200,{csrf:s.csrf,username:store.data.admin?.username||''}); }
-  requireAuth(req);
+  const session = requireAuth(req);
   const admin=()=>store.data.admin;
   const otpUri=secret=>`otpauth://totp/${encodeURIComponent(`AegisRelay:${admin().username}`)}?secret=${secret}&issuer=AegisRelay&digits=6&period=30`;
   if (req.method === 'GET' && rel === '/account') return json(res,200,{username:admin().username,totpEnabled:!!admin().totpSecret,recoveryRemaining:(admin().recoveryDigests||[]).length});
@@ -199,37 +235,44 @@ async function api(req, res, rel, cookiePath = cfg.adminPath) {
     return json(res,200,{ok:true,icon});
   }
   if (req.method === 'POST' && rel === '/account/password') {
+    if (!accountLimiter.take(ip(req))) return json(res,429,{error:'操作过于频繁，请稍后再试'});
     const b=await body(req);
-    if(!verifyPassword(b.currentPassword||'',admin().passwordHash)){store.audit('account.password_denied',ip(req));return json(res,401,{error:'当前密码不正确'});}
+    if(!(await verifyPasswordAsync(b.currentPassword||'',admin().passwordHash))){store.audit('account.password_denied',ip(req));return json(res,401,{error:'当前密码不正确'});}
     admin().passwordHash=hashPassword(b.newPassword||'');
+    for(const sid of Object.keys(sessions))if(sid!==session.sid)delete sessions[sid];
     store.audit('account.password_changed',ip(req));store.save();
     return json(res,200,{ok:true});
   }
   // Enrolment is two-step: the secret stays pending until a generated code proves the app has it.
   if (req.method === 'POST' && rel === '/account/totp/begin') {
+    if (!accountLimiter.take(ip(req))) return json(res,429,{error:'操作过于频繁，请稍后再试'});
     const b=await body(req);
-    if(!verifyPassword(b.password||'',admin().passwordHash))return json(res,401,{error:'当前密码不正确'});
+    if(!(await verifyPasswordAsync(b.password||'',admin().passwordHash)))return json(res,401,{error:'当前密码不正确'});
     const secret=newTotpSecret();
     admin().pendingTotp={secret,startedAt:new Date().toISOString()};store.save();
     const uri=otpUri(secret);
     return json(res,200,{secret,uri,qr:qrRows(uri)});
   }
   if (req.method === 'POST' && rel === '/account/totp/enable') {
+    if (!accountLimiter.take(ip(req))) return json(res,429,{error:'操作过于频繁，请稍后再试'});
     const b=await body(req),pending=admin().pendingTotp;
     if(!pending?.secret)return json(res,409,{error:'请先重新生成二维码'});
-    if(!verifyTotp(pending.secret,b.code||'')){store.audit('account.totp_failed',ip(req));return json(res,401,{error:'验证码不正确，请确认手机时间已同步'});}
+    const step=verifyTotpStep(pending.secret,b.code||'');
+    if(step===null){store.audit('account.totp_failed',ip(req));return json(res,401,{error:'验证码不正确，请确认手机时间已同步'});}
     const recovery=Array.from({length:8},()=>randomToken(9));
-    admin().totpSecret=pending.secret;admin().recoveryDigests=recovery.map(v=>tokenDigest(v,key));
+    admin().totpSecret=pending.secret;admin().lastTotpStep=step;admin().recoveryDigests=recovery.map(v=>tokenDigest(v,key));
     delete admin().pendingTotp;
+    for(const sid of Object.keys(sessions))if(sid!==session.sid)delete sessions[sid];
     store.audit('account.totp_enabled',ip(req));store.save();
     return json(res,200,{ok:true,recovery});
   }
   if (req.method === 'POST' && rel === '/account/totp/disable') {
+    if (!accountLimiter.take(ip(req))) return json(res,429,{error:'操作过于频繁，请稍后再试'});
     const b=await body(req);
     if(!admin().totpSecret)return json(res,409,{error:'两步验证尚未开启'});
-    if(!verifyPassword(b.password||'',admin().passwordHash))return json(res,401,{error:'当前密码不正确'});
-    if(!verifyTotp(admin().totpSecret,b.code||''))return json(res,401,{error:'验证码不正确'});
-    admin().totpSecret=null;admin().recoveryDigests=[];delete admin().pendingTotp;
+    if(!(await verifyPasswordAsync(b.password||'',admin().passwordHash)))return json(res,401,{error:'当前密码不正确'});
+    if(verifyTotpStep(admin().totpSecret,b.code||'',Date.now(),admin().lastTotpStep??null)===null)return json(res,401,{error:'验证码不正确'});
+    admin().totpSecret=null;admin().lastTotpStep=null;admin().recoveryDigests=[];delete admin().pendingTotp;
     store.audit('account.totp_disabled',ip(req));store.save();
     return json(res,200,{ok:true});
   }

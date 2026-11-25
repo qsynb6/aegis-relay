@@ -67,7 +67,7 @@ async function start(){
   try{const status=await call('/status');$('#auth').classList.remove('hidden');$(status.initialized?'#login':'#setup').classList.remove('hidden')}catch(e){$('#gate-msg').textContent=e.message}
 }
 $('#setup-btn').onclick=async()=>{try{await call('/setup',{method:'POST',body:JSON.stringify({username:value('#su-user'),password:value('#su-pass'),setupToken:value('#su-token')})});$('#setup').classList.add('hidden');$('#login').classList.remove('hidden');$('#gate-msg').textContent='管理员已创建，请用密码登录；可稍后在“个人设置”开启两步验证。'}catch(e){$('#gate-msg').textContent=e.message}};
-$('#login-btn').onclick=async()=>{try{const data=await call('/login',{method:'POST',body:JSON.stringify({password:value('#password'),code:value('#code')})});state.csrf=data.csrf;await enterApp()}catch(e){$('#gate-msg').textContent=e.message}};
+$('#login-btn').onclick=async()=>{try{const data=await call('/login',{method:'POST',body:JSON.stringify({password:value('#password'),code:value('#code'),recovery:value('#recovery').trim()})});setValue('#password','');setValue('#code','');setValue('#recovery','');state.csrf=data.csrf;await enterApp()}catch(e){$('#gate-msg').textContent=e.message}};
 $('#logout').onclick=async()=>{try{await call('/logout',{method:'POST',body:'{}'})}finally{location.reload()}};
 
 async function refreshAll(){const [routes,dashboard]=await Promise.all([call('/routes'),call('/dashboard')]);state.routes=routes.routes;state.dashboard=dashboard;renderRoutes();renderDashboard(dashboard);renderTraffic(dashboard);fillDiagnosticNodes()}

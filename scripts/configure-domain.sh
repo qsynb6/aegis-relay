@@ -6,7 +6,7 @@ DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$2
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
 printf '%s' "$DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "域名格式无效" >&2; exit 1; }
-printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "邮箱格式无效" >&2; exit 1; }
+printf '%s' "$EMAIL" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' || { echo "邮箱格式无效" >&2; exit 1; }
 [ -f "$INSTALL_DIR/.env" ] || { echo "未找到 AegisRelay 安装" >&2; exit 1; }
 # 第三方软件源失效（如 402/GPG 过期）不应中断本脚本：所需软件包通常已安装，
 # 真正缺包时下面的 apt-get install 仍会明确报错。

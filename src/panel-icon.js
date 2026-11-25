@@ -8,7 +8,7 @@ export const MAX_ICON_BYTES = 256 * 1024;
 // Aliased vendor MIME types collapse to one canonical value so the stored icon stays predictable.
 const ICON_TYPES = new Map([
   ['image/png', 'image/png'], ['image/jpeg', 'image/jpeg'], ['image/gif', 'image/gif'],
-  ['image/webp', 'image/webp'], ['image/svg+xml', 'image/svg+xml'],
+  ['image/webp', 'image/webp'],
   ['image/x-icon', 'image/x-icon'], ['image/vnd.microsoft.icon', 'image/x-icon'],
 ]);
 
@@ -18,7 +18,7 @@ export function normalizePanelIcon(value) {
   const match = raw.match(/^data:([a-z0-9.+/-]+);base64,([A-Za-z0-9+/=]+)$/i);
   if (!match) throw new Error('图标必须是 base64 编码的图片数据');
   const mime = ICON_TYPES.get(match[1].toLowerCase());
-  if (!mime) throw new Error('仅支持 PNG、JPG、GIF、WebP、SVG 或 ICO 格式的图标');
+  if (!mime) throw new Error('仅支持 PNG、JPG、GIF、WebP 或 ICO 格式的图标');
   const bytes = Buffer.from(match[2], 'base64');
   if (!bytes.length) throw new Error('图标内容为空');
   if (bytes.length > MAX_ICON_BYTES) throw new Error('图标不能超过 256KB');

@@ -12,6 +12,7 @@ test('valid image data URIs are kept and vendor icon types collapse to one canon
 test('non-image and malformed payloads are rejected',()=>{
   assert.throws(()=>normalizePanelIcon('https://example.com/a.png'),/base64/);
   assert.throws(()=>normalizePanelIcon(`data:text/html;base64,${PNG.toString('base64')}`),/仅支持/);
+  assert.throws(()=>normalizePanelIcon(`data:image/svg+xml;base64,${Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64')}`),/仅支持/);
   assert.throws(()=>normalizePanelIcon('data:image/png;base64,'),/base64/);
   assert.throws(()=>normalizePanelIcon('data:image/png;base64,!!!!'),/base64/);
 });

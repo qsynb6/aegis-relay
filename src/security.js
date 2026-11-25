@@ -14,16 +14,36 @@ export function deriveKey(secret) {
 }
 
 export function hashPassword(password, salt = crypto.randomBytes(16)) {
-  if (String(password).length < 14) throw new Error('password must contain at least 14 characters');
-  const digest = crypto.scryptSync(password, salt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+  const raw = String(password);
+  if (raw.length < 14) throw new Error('password must contain at least 14 characters');
+  if (raw.length > 1024) throw new Error('password must not exceed 1024 characters');
+  const digest = crypto.scryptSync(raw, salt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
   return `scrypt$32768$${b64u(salt)}$${b64u(digest)}`;
 }
 
 export function verifyPassword(password, encoded) {
   try {
+    const raw = String(password);
+    if (raw.length > 1024) return false;
     const [kind, n, salt, expected] = encoded.split('$');
     if (kind !== 'scrypt' || n !== '32768') return false;
-    const actual = crypto.scryptSync(password, Buffer.from(salt, 'base64url'), 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+    const actual = crypto.scryptSync(raw, Buffer.from(salt, 'base64url'), 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+    return timingEqual(actual, Buffer.from(expected, 'base64url'));
+  } catch { return false; }
+}
+
+export async function verifyPasswordAsync(password, encoded) {
+  try {
+    const raw = String(password);
+    if (raw.length > 1024) return false;
+    const [kind, n, salt, expected] = String(encoded || '').split('$');
+    if (kind !== 'scrypt' || n !== '32768' || !salt || !expected) return false;
+    const actual = await new Promise((resolve, reject) => {
+      crypto.scrypt(raw, Buffer.from(salt, 'base64url'), 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (err, derived) => {
+        if (err) reject(err);
+        else resolve(derived);
+      });
+    });
     return timingEqual(actual, Buffer.from(expected, 'base64url'));
   } catch { return false; }
 }
@@ -51,17 +71,34 @@ export function totp(secret, at = Date.now(), step = 30) {
   return String((h.readUInt32BE(off) & 0x7fffffff) % 1_000_000).padStart(6, '0');
 }
 
+export function verifyTotpStep(secret, code, now = Date.now(), lastUsedStep = null) {
+  if (!/^\d{6}$/.test(String(code))) return null;
+  let matchedStep = null;
+  for (const w of [-1, 0, 1]) {
+    const t = now + w * 30000;
+    if (t >= 0 && timingEqual(totp(secret, t), code)) {
+      matchedStep = Math.floor(t / 1000 / 30);
+      break;
+    }
+  }
+  if (matchedStep === null) return null;
+  if (lastUsedStep !== null && lastUsedStep !== undefined && matchedStep <= Number(lastUsedStep)) return null;
+  return matchedStep;
+}
+
 export function verifyTotp(secret, code, now = Date.now()) {
-  return /^\d{6}$/.test(String(code)) && [-1, 0, 1].some(w => now + w * 30000 >= 0 && timingEqual(totp(secret, now + w * 30000), code));
+  return verifyTotpStep(secret, code, now) !== null;
 }
 
 export function isPrivateIP(ip) {
-  ip = ip.replace(/^::ffff:/, '');
+  ip = String(ip || '').trim().toLowerCase().replace(/^::ffff:/, '');
   if (net.isIPv4(ip)) {
-    const [a,b] = ip.split('.').map(Number);
-    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+    const [a, b, c] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || (a === 100 && b >= 64 && b <= 127) || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 0 && c === 0) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
   }
-  if (net.isIPv6(ip)) return ip === '::1' || ip === '::' || ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('fe8') || ip.startsWith('fe9') || ip.startsWith('fea') || ip.startsWith('feb');
+  if (net.isIPv6(ip)) {
+    return ip === '::1' || ip === '::' || /^0(:0){6}:0?1$/.test(ip) || /^0(:0){7}$/.test(ip) || ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('fe8') || ip.startsWith('fe9') || ip.startsWith('fea') || ip.startsWith('feb') || ip.startsWith('ff') || ip.startsWith('64:ff9b:');
+  }
   return true;
 }
 
@@ -85,13 +122,47 @@ export class RateLimiter {
   }
 }
 
-// The panel refuses X-Forwarded-For from clients, but our own Nginx on the same host sets
-// X-Real-IP. Trust that single hop only when the TCP peer really is loopback — otherwise every
-// login shares one 127.0.0.1 rate-limit bucket and audit rows never show the actual client.
-export function requestIp(req) {
+export class LoginGuard {
+  constructor(threshold = 5, baseDelayMs = 15_000, maxDelayMs = 15 * 60_000) {
+    this.threshold = threshold;
+    this.baseDelayMs = baseDelayMs;
+    this.maxDelayMs = maxDelayMs;
+    this.failures = 0;
+    this.lockedUntil = 0;
+  }
+  check(now = Date.now()) {
+    return {
+      allowed: now >= this.lockedUntil,
+      retryAfter: Math.max(0, Math.ceil((this.lockedUntil - now) / 1000))
+    };
+  }
+  recordFailure(now = Date.now()) {
+    this.failures++;
+    if (this.failures >= this.threshold) {
+      this.lockedUntil = now + Math.min(this.maxDelayMs, this.baseDelayMs * (2 ** Math.min(this.failures - this.threshold, 8)));
+    }
+  }
+  recordSuccess() {
+    this.failures = 0;
+    this.lockedUntil = 0;
+  }
+}
+
+// The panel refuses X-Forwarded-For from clients, but our own Nginx on the same host (or Docker
+// bridge gateway when ports are bound only to 127.0.0.1) sets X-Real-IP. Trust that single hop
+// only when the TCP peer is loopback, an explicitly trusted proxy, or a local private bridge peer
+// when container ports are host-loopback-bound.
+export function requestIp(req, env = process.env) {
   const remote = String(req.socket?.remoteAddress || 'unknown').replace(/^::ffff:/, '');
-  if (remote === '127.0.0.1' || remote === '::1') {
-    const real = String(req.headers?.['x-real-ip'] || '').trim().replace(/^::ffff:/, '');
+  const trustedList = String(env.TRUSTED_PROXIES || '').split(',').map(s => s.trim()).filter(Boolean);
+  const dockerLocalBound = env.ADMIN_PUBLISH_IP === '127.0.0.1' || env.PROXY_PUBLISH_IP === '127.0.0.1';
+  const isPrivatePeer = net.isIP(remote) !== 0 && isPrivateIP(remote);
+  const trusted = remote === '127.0.0.1' || remote === '::1'
+    || trustedList.includes(remote)
+    || (trustedList.includes('private') && isPrivatePeer)
+    || (dockerLocalBound && isPrivatePeer);
+  if (trusted) {
+    const real = String(req.headers?.['x-real-ip'] || '').split(',')[0].trim().replace(/^::ffff:/, '');
     if (net.isIP(real)) return real;
   }
   return remote;

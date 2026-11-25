@@ -5,7 +5,7 @@ import zlib from 'node:zlib';
 import { pipeline, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import dnsPromises from 'node:dns/promises';
-import { isPrivateIP } from './security.js';
+import { isPrivateIP, requestIp } from './security.js';
 import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-auth.js';
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
@@ -49,12 +49,11 @@ export function clearTlsSessions(){ tlsSessions.clear(); }
 // IP comes from the X-Real-IP the fronting Nginx sets (the relay strips it before going upstream, so
 // the upstream never sees it); the device fields come from the Emby headers / auth line / query.
 const clipText=(v,n=80)=>String(v||'').replace(/[\r\n\0]/g,'').trim().slice(0,n);
-const firstForwarded=v=>String(v||'').split(',')[0].trim();
 function hasViewerIdentity(req,incoming){ const h=req.headers,q=incoming.searchParams; return !!(h['x-emby-authorization']||h['x-emby-token']||h.authorization||q.get('api_key')||q.get('X-Emby-Token')||q.get('X-MediaBrowser-Token')); }
 function accessInfoFrom(req,incoming){
   const h=req.headers;
-  const ip=firstForwarded(h['x-real-ip'])||firstForwarded(h['x-forwarded-for'])||String(req.socket?.remoteAddress||'').replace(/^::ffff:/,'');
-  if(!ip)return null;
+  const ip=requestIp(req);
+  if(!ip||ip==='unknown')return null;
   const auth=String(h['x-emby-authorization']||h.authorization||''),q=incoming.searchParams;
   const field=re=>{const m=auth.match(re);return m?m[1]:'';};
   return { ip:clipText(ip,45),
@@ -727,7 +726,15 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
     markSuccess(found.route,targets[0]);
     s.on('error',()=>s.destroy());
     if(clientGone||socket.destroyed)return s.destroy();
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k,v])=>`${k}: ${v}`).join('\r\n')}\r\n\r\n`);
+    const upgradeHeaders=stripAdminSetCookies({...r.headers});
+    const headerLines=[];
+    for(const [k,v] of Object.entries(upgradeHeaders)){
+      if(v===undefined)continue;
+      const safeK=String(k).replace(/[\r\n]/g,'');
+      const vals=Array.isArray(v)?v:[v];
+      for(const item of vals)headerLines.push(`${safeK}: ${String(item).replace(/[\r\n]/g,'')}`);
+    }
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\n${headerLines.join('\r\n')}\r\n\r\n`);
     if(h.length)socket.write(h);if(head.length)s.write(head);
     s.pipe(socket);socket.pipe(s);
   });
